@@ -2,15 +2,21 @@ import os
 from typing import Optional
 
 import pandas as pd
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from functools import lru_cache
 
-app = FastAPI(title="SmartFactory IoT Stats API")
+app = FastAPI(title="SmartFactory IoT Stats API", debug=True)
 
 CSV_PATH = "q-fastapi-timeseries-cache.csv"
-df = pd.read_csv(CSV_PATH)
-df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+try:
+    df = pd.read_csv(CSV_PATH)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "value", "location", "sensor"])
+except Exception as e:
+    raise RuntimeError(f"Failed to load CSV: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,11 +44,11 @@ def compute_stats(
         filtered = filtered[filtered["sensor"] == sensor]
 
     if start_date:
-        start_dt = pd.to_datetime(start_date, utc=True)
+        start_dt = pd.to_datetime(start_date, utc=True, errors="raise")
         filtered = filtered[filtered["timestamp"] >= start_dt]
 
     if end_date:
-        end_dt = pd.to_datetime(end_date, utc=True)
+        end_dt = pd.to_datetime(end_date, utc=True, errors="raise")
         filtered = filtered[filtered["timestamp"] <= end_dt]
 
     if filtered.empty:
@@ -53,7 +59,7 @@ def compute_stats(
             "max": 0.0
         }
 
-    values = filtered["value"].astype(float)
+    values = filtered["value"]
 
     return {
         "count": int(values.count()),
@@ -70,19 +76,25 @@ def get_stats(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ):
-    cache_key = (location, sensor, start_date, end_date)
-    cache_hit = cache_key in _seen_cache_keys
+    try:
+        cache_key = (location, sensor, start_date, end_date)
+        cache_hit = cache_key in _seen_cache_keys
 
-    stats = compute_stats(location, sensor, start_date, end_date)
-    _seen_cache_keys.add(cache_key)
+        stats = compute_stats(location, sensor, start_date, end_date)
+        _seen_cache_keys.add(cache_key)
 
-    response.headers["X-Cache"] = "HIT" if cache_hit else "MISS"
+        response.headers["X-Cache"] = "HIT" if cache_hit else "MISS"
+        return {"stats": stats}
 
-    return {"stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "records": int(len(df))}
+    return {
+        "status": "healthy",
+        "records": int(len(df))
+    }
 
 if __name__ == "__main__":
     import uvicorn
